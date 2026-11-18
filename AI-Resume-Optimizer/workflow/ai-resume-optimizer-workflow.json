@@ -1,0 +1,258 @@
+{
+  "name": "AI Resume Optimizer",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "AI Resume Optimizer",
+        "formDescription": "Upload a text-based PDF resume and paste the target job description to receive an AI-assisted match analysis.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Resume (PDF)",
+              "fieldType": "file",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Job Description",
+              "fieldType": "textarea",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Target Role",
+              "fieldType": "text",
+              "requiredField": false
+            }
+          ]
+        },
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "f001",
+      "name": "AI Resume Optimizer Form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "ai-resume-optimizer-form"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "Resume (PDF)",
+        "options": {}
+      },
+      "id": "f002",
+      "name": "Extract Resume PDF",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Prepare Data\n// Expected input: Extract From File output, plus original Form Trigger fields.\n// Update the node name in $('AI Resume Optimizer Form') if you rename the trigger.\n\nconst extracted = $input.first()?.json ?? {};\nconst form = $('AI Resume Optimizer Form').first()?.json ?? {};\n\nfunction cleanText(value) {\n  return String(value ?? '')\n    .normalize('NFKC')\n    .replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]/g, ' ')\n    .replace(/[ \\t]+/g, ' ')\n    .replace(/\\r\\n?/g, '\\n')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n}\n\nfunction chunkSentences(text, sentencesPerChunk = 3) {\n  const sentences = text\n    .split(/(?<=[.!?])\\s+/)\n    .map(s => s.trim())\n    .filter(s => s.length > 20);\n\n  const chunks = [];\n  for (let i = 0; i < sentences.length; i += sentencesPerChunk) {\n    const chunk = sentences.slice(i, i + sentencesPerChunk).join(' ');\n    if (chunk) chunks.push(chunk);\n  }\n  return chunks.length ? chunks : (text.length > 0 ? [text] : []);\n}\n\nconst resume = cleanText(\n  extracted.text ?? extracted.extractedText ?? extracted.data ?? ''\n);\nconst jobDescription = cleanText(\n  form[\"Job Description\"] ?? form.jobDescription ?? form.job_description ?? ''\n);\nconst targetRole = cleanText(form[\"Target Role\"] ?? form.targetRole ?? '');\n\nif (!resume) {\n  throw new Error(\n    'No readable text was extracted from the uploaded PDF. Use a text-based PDF or add an OCR service for scanned resumes.'\n  );\n}\nif (!jobDescription) {\n  throw new Error('Job Description is required.');\n}\n\nconst resumeChunks = chunkSentences(resume);\nconst jdChunks = chunkSentences(jobDescription);\n\nif (!resumeChunks.length || !jdChunks.length) {\n  throw new Error('Unable to create text chunks from the resume or job description.');\n}\n\nconst allChunks = [...resumeChunks, ...jdChunks];\n\nreturn [{\n  json: {\n    resume,\n    jobDescription,\n    targetRole,\n    resumeChunks,\n    jdChunks,\n    resumeChunkCount: resumeChunks.length,\n    jdChunkCount: jdChunks.length,\n    embeddingRequests: allChunks.map(text => ({\n      model: 'models/gemini-embedding-001',\n      content: { parts: [{ text }] },\n      outputDimensionality: 768\n    }))\n  }\n}];\n"
+      },
+      "id": "f003",
+      "name": "Prepare Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { requests: $json.embeddingRequests } }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "f004",
+      "name": "Generate Gemini Embeddings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Calculate Semantic Similarity\n// Expects the Gemini batchEmbedContents response in $input and Prepare Data upstream.\n\nconst prepared = $('Prepare Data').first().json;\nconst response = $input.first().json;\nconst embeddings = response.embeddings ?? response.data ?? [];\n\nconst resumeCount = prepared.resumeChunks.length;\nconst jdCount = prepared.jdChunks.length;\nconst expectedCount = resumeCount + jdCount;\n\nif (!Array.isArray(embeddings) || embeddings.length !== expectedCount) {\n  throw new Error(`Embedding count mismatch. Expected ${expectedCount}, received ${embeddings.length}.`);\n}\n\nconst vectors = embeddings.map((item, index) => {\n  const values = item.values ?? item.embedding?.values ?? item.embedding;\n  if (!Array.isArray(values) || values.length === 0) {\n    throw new Error(`Missing embedding vector at position ${index}.`);\n  }\n  return values;\n});\n\nconst resumeVectors = vectors.slice(0, resumeCount);\nconst jdVectors = vectors.slice(resumeCount);\n\nfunction cosine(a, b) {\n  if (a.length !== b.length) throw new Error('Embedding dimensions do not match.');\n  let dot = 0, normA = 0, normB = 0;\n  for (let i = 0; i < a.length; i++) {\n    dot += a[i] * b[i];\n    normA += a[i] * a[i];\n    normB += b[i] * b[i];\n  }\n  const denominator = Math.sqrt(normA) * Math.sqrt(normB);\n  return denominator === 0 ? 0 : dot / denominator;\n}\n\nconst threshold = 0.45;\nconst matches = jdVectors.map((jdVector, index) => {\n  let bestScore = -1;\n  let bestIndex = -1;\n  resumeVectors.forEach((resumeVector, resumeIndex) => {\n    const score = cosine(jdVector, resumeVector);\n    if (score > bestScore) {\n      bestScore = score;\n      bestIndex = resumeIndex;\n    }\n  });\n  return {\n    jdChunk: prepared.jdChunks[index],\n    bestResumeChunk: prepared.resumeChunks[bestIndex] ?? '',\n    similarity: Math.max(0, bestScore),\n    matchedResumeChunkIndex: bestIndex\n  };\n});\n\nconst average = matches.reduce((sum, item) => sum + item.similarity, 0) / matches.length;\nconst semanticScore = Math.round(average * 100);\nconst weakRequirements = matches\n  .filter(item => item.similarity < threshold)\n  .map(item => item.jdChunk);\n\nreturn [{\n  json: {\n    resume: prepared.resume,\n    jobDescription: prepared.jobDescription,\n    targetRole: prepared.targetRole,\n    semanticScore,\n    weakRequirements,\n    chunkMatches: matches,\n    similarityThreshold: threshold\n  }\n}];\n"
+      },
+      "id": "f005",
+      "name": "Calculate Semantic Similarity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { contents: [{ parts: [{ text: 'You are a careful resume reviewer. Compare the resume and job description. Do not invent candidate experience. Return ONLY valid JSON with target_role, skills_score, role_match_score, experience_score, matched_skills, missing_skills, role_focus_feedback, project_feedback, rewrite_suggestions, and top_priorities. All scores must be integers 0-100. Distinguish missing evidence from proof of missing ability.\\n\\nRESUME:\\n' + $json.resume + '\\n\\nJOB DESCRIPTION:\\n' + $json.jobDescription + '\\n\\nTARGET ROLE:\\n' + ($json.targetRole || 'Not specified') + '\\n\\nWEAK REQUIREMENTS:\\n' + JSON.stringify($json.weakRequirements) }] }], generationConfig: { temperature: 0.1, responseMimeType: 'application/json' } } }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "f006",
+      "name": "Gemini Resume Evaluation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Calculate Final Score\n// Expects parsed Gemini JSON from the preceding LLM HTTP Request.\n\nconst semantic = $('Calculate Semantic Similarity').first().json;\nconst raw = $input.first().json;\n\nfunction extractText(payload) {\n  if (typeof payload === 'string') return payload;\n  return payload.candidates?.[0]?.content?.parts?.map(p => p.text ?? '').join('\\n')\n    ?? payload.text\n    ?? payload.output\n    ?? '';\n}\n\nconst text = extractText(raw).trim();\nlet evaluation;\ntry {\n  const cleaned = text.replace(/^```(?:json)?\\s*/i, '').replace(/\\s*```$/, '');\n  evaluation = JSON.parse(cleaned);\n} catch (error) {\n  throw new Error(`Could not parse Gemini evaluation as JSON: ${error.message}. Raw response: ${text.slice(0, 500)}`);\n}\n\nconst clamp = value => Math.max(0, Math.min(100, Number(value) || 0));\nconst skills = clamp(evaluation.skills_score);\nconst roleMatch = clamp(evaluation.role_match_score);\nconst experience = clamp(evaluation.experience_score);\nconst semanticScore = clamp(semantic.semanticScore);\n\nconst finalScore = Math.round(\n  0.40 * semanticScore +\n  0.30 * skills +\n  0.20 * roleMatch +\n  0.10 * experience\n);\n\nconst verdict = finalScore >= 80\n  ? 'Strong Match'\n  : finalScore >= 60\n    ? 'Moderate Match'\n    : 'Weak Match';\n\nreturn [{\n  json: {\n    project: 'AI Resume Optimizer',\n    targetRole: semantic.targetRole || evaluation.target_role || 'Not specified',\n    finalScore,\n    verdict,\n    componentScores: {\n      semantic: semanticScore,\n      skills,\n      roleMatch,\n      experience\n    },\n    matchedSkills: evaluation.matched_skills ?? [],\n    missingSkills: evaluation.missing_skills ?? [],\n    roleFocusFeedback: evaluation.role_focus_feedback ?? '',\n    projectFeedback: evaluation.project_feedback ?? '',\n    rewriteSuggestions: evaluation.rewrite_suggestions ?? [],\n    topPriorities: evaluation.top_priorities ?? [],\n    weakRequirements: semantic.weakRequirements,\n    chunkMatches: semantic.chunkMatches,\n    disclaimer: 'This is an advisory estimate based on the supplied resume and job description, not a hiring decision or a guarantee of ATS performance.'\n  }\n}];\n"
+      },
+      "id": "f007",
+      "name": "Calculate Final Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "f008",
+      "name": "Display Analysis Result",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 1,
+      "position": [
+        1920,
+        300
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "AI Resume Optimizer Form": {
+      "main": [
+        [
+          {
+            "node": "Extract Resume PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Resume PDF": {
+      "main": [
+        [
+          {
+            "node": "Prepare Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Data": {
+      "main": [
+        [
+          {
+            "node": "Generate Gemini Embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Gemini Embeddings": {
+      "main": [
+        [
+          {
+            "node": "Calculate Semantic Similarity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Semantic Similarity": {
+      "main": [
+        [
+          {
+            "node": "Gemini Resume Evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Resume Evaluation": {
+      "main": [
+        [
+          {
+            "node": "Calculate Final Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Final Score": {
+      "main": [
+        [
+          {
+            "node": "Display Analysis Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "ai-resume-optimizer-initial",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

@@ -1,0 +1,85 @@
+AI RESUME OPTIMIZER — NODE PROMPTS AND CONFIGURATION
+=====================================================
+
+1. GEMINI EVALUATION PROMPT
+---------------------------
+You are a careful resume reviewer. Compare the supplied resume with the supplied job
+description. Evaluate only evidence present in the resume. Do not invent skills, work
+experience, qualifications, certifications, employers, dates, or achievements.
+
+RESUME:
+{{ $json.resume }}
+
+JOB DESCRIPTION:
+{{ $json.jobDescription }}
+
+TARGET ROLE:
+{{ $json.targetRole || "Not specified" }}
+
+WEAKLY MATCHED JOB-DESCRIPTION REQUIREMENTS FROM SEMANTIC ANALYSIS:
+{{ JSON.stringify($json.weakRequirements || []) }}
+
+Return ONLY valid JSON with these fields:
+{
+  "target_role": "string",
+  "skills_score": 0,
+  "role_match_score": 0,
+  "experience_score": 0,
+  "matched_skills": ["skill and brief evidence"],
+  "missing_skills": ["requirement not clearly evidenced"],
+  "role_focus_feedback": "specific assessment",
+  "project_feedback": "specific assessment of project relevance and descriptions",
+  "rewrite_suggestions": [
+    {"original_issue": "string", "suggested_revision": "string", "reason": "string"}
+  ],
+  "top_priorities": ["actionable improvement"]
+}
+
+Scoring rules:
+- Every score must be an integer from 0 to 100.
+- skills_score measures evidence for required technical and professional skills.
+- role_match_score measures alignment with the responsibilities and target role.
+- experience_score measures relevance and strength of demonstrated experience.
+- Do not award credit merely because a term appears; look for contextual evidence.
+- Do not penalize a fresher simply for lacking years of professional employment.
+- Clearly distinguish missing evidence from proof that the candidate lacks a skill.
+- Keep feedback constructive, specific, and grounded in the supplied material.
+- Never recommend adding an experience or skill the candidate does not possess.
+
+2. STRUCTURED OUTPUT EXPECTATIONS
+--------------------------------
+The downstream scoring node requires numeric fields:
+  skills_score
+  role_match_score
+  experience_score
+
+The remaining fields should be arrays or strings as shown above. If an array has
+no entries, return an empty array rather than null.
+
+3. EMBEDDING REQUEST
+--------------------
+Provider: Google Gemini
+Endpoint:
+POST https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents
+
+Each request contains:
+{
+  "model": "models/gemini-embedding-001",
+  "content": {"parts": [{"text": "text chunk"}]},
+  "outputDimensionality": 768
+}
+
+4. FINAL SCORE
+--------------
+FinalScore = 0.40 * Semantic
+           + 0.30 * Skills
+           + 0.20 * RoleMatch
+           + 0.10 * Experience
+
+Verdicts:
+  80–100: Strong Match
+  60–79:  Moderate Match
+  0–59:   Weak Match
+
+The weights and the 0.45 semantic threshold are initial project parameters and should
+be calibrated against an anonymized evaluation dataset before making performance claims.
